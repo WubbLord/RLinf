@@ -23,7 +23,9 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "libero_10_grpo_openvlaoft_eval"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: ["wandb"] # wandb, swanlab, tensorboard
+    wandb_entity: wubblord-massachusetts-institute-of-technology
+    wandb_project: test
 
   max_epochs: 1000
   max_steps: -1
@@ -84,6 +86,9 @@ algorithm:
 env:
   group_name: "EnvGroup"
 
+  train:
+    total_num_envs: 500  # unused in eval-only mode, but required by rollout worker
+
   eval:
     total_num_envs: 500
     auto_reset: True
@@ -106,7 +111,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero10-traj1/"
+    model_path: "models/Openvla-oft-SFT-libero10-trajall/"
     precision: ${actor.model.precision}
 
 actor:
@@ -119,7 +124,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero10-traj1/"
+    model_path: "/path/to/model/Openvla-oft-SFT-libero10-trajall/"
     model_type: "openvla_oft"
     max_prompt_length: 128
 

@@ -19,4 +19,14 @@ outputs/*
 uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
+<<<<<<< HEAD
 *.egg-info/
+=======
+
+#own
+.env
+.env.*
+models/
+prometheus-*/
+data/
+>>>>>>> 0ff8c5d (trying to eval embodiment)

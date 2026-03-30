@@ -4,8 +4,10 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-export MUJOCO_GL="osmesa"
-export PYOPENGL_PLATFORM="osmesa"
+# export MUJOCO_GL="osmesa"
+# export PYOPENGL_PLATFORM="osmesa"
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
@@ -49,6 +51,31 @@ else
 fi
 
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
+
+# Check if config yaml uses wandb as a logger backend; if so, load credentials and set env vars
+CONFIG_FILE="${EMBODIED_PATH}/config/${CONFIG_NAME}.yaml"
+if grep -q "wandb" "${CONFIG_FILE}" 2>/dev/null && \
+   grep "logger_backends" "${CONFIG_FILE}" 2>/dev/null | grep -q "wandb"; then
+    echo "wandb detected in logger_backends, loading credentials..."
+    ENV_FILE="${REPO_PATH}/.env"
+    if [ -f "${ENV_FILE}" ]; then
+        _WANDB_API_KEY=$(grep -E "^WANDB_API_KEY=" "${ENV_FILE}" | cut -d'=' -f2-)
+        if [ -n "${_WANDB_API_KEY}" ]; then
+            export WANDB_API_KEY="${_WANDB_API_KEY}"
+            echo "WANDB_API_KEY loaded from ${ENV_FILE}"
+        else
+            echo "Warning: WANDB_API_KEY not found in ${ENV_FILE}"
+        fi
+        unset _WANDB_API_KEY
+    else
+        echo "Warning: .env file not found at ${ENV_FILE}"
+    fi
+    _WANDB_ENTITY=$(grep "wandb_entity:" "${CONFIG_FILE}" | awk '{print $2}' | tr -d '"')
+    _WANDB_PROJECT=$(grep "wandb_project:" "${CONFIG_FILE}" | awk '{print $2}' | tr -d '"')
+    [ -n "${_WANDB_ENTITY}" ]  && export WANDB_ENTITY="${_WANDB_ENTITY}"  && echo "WANDB_ENTITY=${WANDB_ENTITY}"
+    [ -n "${_WANDB_PROJECT}" ] && export WANDB_PROJECT="${_WANDB_PROJECT}" && echo "WANDB_PROJECT=${WANDB_PROJECT}"
+    unset _WANDB_ENTITY _WANDB_PROJECT
+fi
 
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
