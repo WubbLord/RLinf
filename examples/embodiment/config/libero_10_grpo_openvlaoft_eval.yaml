@@ -90,7 +90,7 @@ env:
     total_num_envs: 500  # unused in eval-only mode, but required by rollout worker
 
   eval:
-    total_num_envs: 500
+    total_num_envs: 1
     auto_reset: True
     ignore_terminations: True
     group_size: 1
@@ -124,7 +124,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero10-trajall/"
+    model_path: "models/Openvla-oft-SFT-libero10-trajall/"
     model_type: "openvla_oft"
     max_prompt_length: 128
 
