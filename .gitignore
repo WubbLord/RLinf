@@ -24,7 +24,7 @@ PKG-INFO
 #own
 .env
 .env.*
-models/
+/models/
 prometheus-*/
 data/
 .venv*

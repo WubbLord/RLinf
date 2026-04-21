@@ -14,7 +14,7 @@
 
 import asyncio
 import os
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -222,6 +222,7 @@ class EmbodiedRewardWorker(Worker):
         self._interact_task = None
 
         self.reward_threshold = self.cfg.reward.get("reward_threshold", 0.6)
+        self.reward_model_type = self.cfg.reward.model.model_type
 
     def model_provider_func(self):
         from rlinf.models.embodiment.reward import get_reward_model_class
@@ -267,10 +268,10 @@ class EmbodiedRewardWorker(Worker):
         local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
         total_last_run_count = 0
         while True:
-            merged_images, last_run_count = await self.recv_merged_reward_input(
+            merged_reward_input, last_run_count = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_image_rewards(images=merged_images)
+            rewards = self._compute_reward_outputs(merged_reward_input)
             self.send_reward_output(output_channel, rewards)
             total_last_run_count += last_run_count
             if total_last_run_count >= local_num_train_envs:
@@ -281,11 +282,11 @@ class EmbodiedRewardWorker(Worker):
 
     async def recv_merged_reward_input(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
-    ) -> tuple[torch.Tensor | np.ndarray, int]:
-        """Receive all mapped reward inputs, merge images on batch dim."""
+    ) -> tuple[dict[str, Any], int]:
+        """Receive all mapped reward inputs and merge them on the batch dim."""
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_ranks[mode]
-        image_batches: list[torch.Tensor | np.ndarray] = []
+        reward_input_batches: list[dict[str, Any]] = []
         last_run_count = 0
         for src_rank, expected_size in src_ranks_and_sizes:
             data = await input_channel.get(
@@ -294,65 +295,131 @@ class EmbodiedRewardWorker(Worker):
                 ),
                 async_op=True,
             ).async_wait()
-            images = data.get("images")
-            actual_size = self._infer_reward_batch_size(images)
+            actual_size = self._infer_reward_batch_size(data)
             assert actual_size == expected_size, (
                 f"Expected reward input batch size {expected_size} from env rank {src_rank}, "
                 f"got {actual_size}."
             )
-            image_batches.append(images)
+            reward_input_batches.append(data)
             last_run = data.get("last_run", None)
             last_run_count += int(last_run.sum().item()) if last_run is not None else 0
 
-        merged_images = self._merge_image_batches(image_batches)
-        return merged_images, last_run_count
+        merged_reward_input = self._merge_reward_input_batches(reward_input_batches)
+        return merged_reward_input, last_run_count
 
     @staticmethod
-    def _merge_image_batches(
-        image_batches: list[torch.Tensor | np.ndarray],
-    ) -> torch.Tensor | np.ndarray:
-        if len(image_batches) == 0:
-            raise ValueError("No image batches received for reward inference.")
-        if all(isinstance(images, torch.Tensor) for images in image_batches):
-            return torch.cat(image_batches, dim=0)
-        if all(isinstance(images, np.ndarray) for images in image_batches):
-            return np.concatenate(image_batches, axis=0)
-        # Fallback for mixed types: cast ndarray to tensor and merge as torch.Tensor.
-        tensor_batches = [
-            images if isinstance(images, torch.Tensor) else torch.from_numpy(images)
-            for images in image_batches
-        ]
-        return torch.cat(tensor_batches, dim=0)
+    def _merge_reward_field(values: list[Any]) -> Any:
+        first_non_none = next((value for value in values if value is not None), None)
+        if first_non_none is None:
+            return None
+        if isinstance(first_non_none, torch.Tensor):
+            return torch.cat(
+                [
+                    value
+                    if isinstance(value, torch.Tensor)
+                    else torch.from_numpy(value)
+                    for value in values
+                    if value is not None
+                ],
+                dim=0,
+            )
+        if isinstance(first_non_none, np.ndarray):
+            if all(
+                isinstance(value, np.ndarray) for value in values if value is not None
+            ):
+                return np.concatenate(
+                    [value for value in values if value is not None], axis=0
+                )
+            tensor_values = [
+                value if isinstance(value, torch.Tensor) else torch.from_numpy(value)
+                for value in values
+                if value is not None
+            ]
+            return torch.cat(tensor_values, dim=0)
+        if isinstance(first_non_none, list):
+            merged: list[Any] = []
+            for value in values:
+                if value is None:
+                    continue
+                merged.extend(value)
+            return merged
+        if isinstance(first_non_none, dict):
+            merged_dict = {}
+            all_keys = {
+                key for value in values if isinstance(value, dict) for key in value
+            }
+            for key in all_keys:
+                merged_dict[key] = EmbodiedRewardWorker._merge_reward_field(
+                    [value.get(key) if value is not None else None for value in values]
+                )
+            return merged_dict
+        return first_non_none
 
     @staticmethod
-    def _infer_reward_batch_size(images: torch.Tensor | np.ndarray) -> int:
-        if isinstance(images, torch.Tensor) or isinstance(images, np.ndarray):
-            return images.shape[0]
-        raise ValueError(f"Unsupported reward input image type: {type(images)}")
+    def _merge_reward_input_batches(
+        reward_input_batches: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if len(reward_input_batches) == 0:
+            raise ValueError("No reward inputs received for reward inference.")
+        merged = {}
+        all_keys = {
+            key for batch in reward_input_batches if batch is not None for key in batch
+        }
+        for key in all_keys:
+            if key == "last_run":
+                continue
+            merged[key] = EmbodiedRewardWorker._merge_reward_field(
+                [
+                    batch.get(key) if batch is not None else None
+                    for batch in reward_input_batches
+                ]
+            )
+        return merged
+
+    @staticmethod
+    def _infer_reward_batch_size(reward_input: Any) -> int:
+        if isinstance(reward_input, dict):
+            for key in ("images", "videos", "task_descriptions"):
+                if key in reward_input and reward_input[key] is not None:
+                    return EmbodiedRewardWorker._infer_reward_batch_size(
+                        reward_input[key]
+                    )
+            for value in reward_input.values():
+                if value is not None:
+                    return EmbodiedRewardWorker._infer_reward_batch_size(value)
+        if isinstance(reward_input, (torch.Tensor, np.ndarray)):
+            return reward_input.shape[0]
+        if isinstance(reward_input, list):
+            return len(reward_input)
+        raise ValueError(
+            f"Unsupported reward input type for batch-size inference: {type(reward_input)}"
+        )
 
     @Worker.timer("compute_image_rewards")
-    def _compute_image_rewards(self, images: torch.Tensor):
-        if isinstance(images, np.ndarray):
-            images = torch.from_numpy(images)
+    def _compute_reward_outputs(self, reward_input: dict[str, Any]) -> torch.Tensor:
+        observations = reward_input
+        task_descriptions = (
+            observations.get("task_descriptions")
+            if isinstance(observations, dict)
+            else None
+        )
+        rewards = self.model.compute_reward(observations, task_descriptions)
+        if not isinstance(rewards, torch.Tensor):
+            rewards = torch.as_tensor(rewards)
+        rewards = rewards.to(device=self.device)
 
-        model_dtype = next(self.model.parameters()).dtype
-        images = images.to(device=self.device, dtype=model_dtype)
-
-        with torch.no_grad():
-            outputs = self.model(images)
-            probs = outputs["probabilities"]
-            rewards = (probs > self.reward_threshold).to(probs.dtype)
+        if self.reward_model_type == "resnet":
+            rewards = (rewards > self.reward_threshold).to(rewards.dtype)
 
         if rewards.dim() == 1:
             rewards = rewards.unsqueeze(-1)
-
         return rewards
 
     def compute_image_rewards(
         self, images: torch.Tensor | np.ndarray
     ) -> torch.Tensor | np.ndarray:
         """Run one-shot reward inference and return CPU results."""
-        rewards = self._compute_image_rewards(images)
+        rewards = self._compute_reward_outputs({"images": images})
         if isinstance(rewards, torch.Tensor):
             return rewards.detach().cpu()
         return rewards
@@ -433,10 +500,10 @@ class EmbodiedRewardWorker(Worker):
 
     async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
         while True:
-            merged_images, _ = await self.recv_merged_reward_input(
+            merged_reward_input, _ = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_image_rewards(images=merged_images)
+            rewards = self._compute_reward_outputs(merged_reward_input)
             self.send_reward_output(output_channel, rewards)
 
     async def stop(self):

@@ -188,16 +188,29 @@ class ResNetRewardModel(BaseImageRewardModel):
 
     def compute_reward(
         self,
-        images: torch.Tensor,
+        observations: Any,
+        task_descriptions: Optional[list[str]] = None,
     ) -> torch.Tensor:
         """Compute rewards for inference.
 
         Args:
-            images: Image tensor of shape [B, C, H, W] or [B, H, W, C].
+            observations: Either an image tensor of shape ``[B, C, H, W]`` or
+                ``[B, H, W, C]`` or a dict containing ``images`` / ``main_images``.
+            task_descriptions: Unused for the ResNet reward model.
 
         Returns:
             torch.Tensor: Reward tensor of shape [B].
         """
+        del task_descriptions
+
+        if isinstance(observations, dict):
+            images = observations.get("images", observations.get("main_images"))
+        else:
+            images = observations
+        if images is None:
+            raise KeyError(
+                "ResNetRewardModel expects `images` or `main_images` in observations."
+            )
 
         # Preprocess and compute rewards
         images = self.preprocess_images(images)

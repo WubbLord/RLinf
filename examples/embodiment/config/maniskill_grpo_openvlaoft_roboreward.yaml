@@ -1,3 +1,11 @@
+# ManiSkill GRPO with OpenVLA-OFT actor and RoboReward video reward model.
+#
+# Notes:
+# - The policy still acts from the standard ManiSkill observation stream.
+# - The external reward worker receives terminal rollout videos plus task
+#   descriptions gathered from the training env.
+# - RoboReward-8B requires a Transformers build with Qwen3-VL support.
+
 defaults:
   - env/maniskill_put_on_plate_in_scene_25_main@env.train
   - env/maniskill_ood_template@env.eval
@@ -11,39 +19,42 @@ hydra:
   output_subdir: null
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
-    
+
 cluster:
   num_nodes: 1
   component_placement:
-    actor, env, rollout: all
+    actor: 0
+    env: 0
+    rollout: 0
+    reward: 0
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "maniskill_grpo_openvlaoft"
-    logger_backends: ["wandb"] # wandb, swanlab
+    experiment_name: "maniskill_grpo_openvlaoft_roboreward"
+    logger_backends: ["wandb"]
 
-  max_epochs: 1 # 1000
+  max_epochs: 3
   max_steps: -1
 
-  only_eval: True
-  val_check_interval: 1
+  only_eval: False
+  val_check_interval: -1
   save_interval: 1
 
-  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: logs/20260419-19:47:35-maniskill_grpo_openvlaoft/maniskill_grpo_openvlaoft/checkpoints/global_step_1/actor/model_state_dict/full_weights.pt  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  resume_dir: null
+  ckpt_path: null
 
 algorithm:
   normalize_advantages: True
-  kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
+  kl_penalty: kl
   group_size: 8
 
   rollout_epoch: 1
-  eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+  eval_rollout_epoch: 1
 
-  reward_type: action_level  # action_level or chunk_level
+  reward_type: action_level
   logprob_type: token_level
   entropy_type: token_level
 
@@ -61,7 +72,6 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  # params for rollout
   sampling_params:
     do_sample: True
     temperature_train: 1.0
@@ -70,8 +80,6 @@ algorithm:
     top_p: 1.0
     repetition_penalty: 1.0
 
-  # length argument for autoregressive sampling
-  # max length means max amount of tokens to generate
   length_params:
     max_new_token: null
     max_length: 1024
@@ -80,12 +88,16 @@ algorithm:
 env:
   group_name: "EnvGroup"
 
-  # Override the default values in env/maniskill_put_on_plate_in_scene_25_main and env/maniskill_ood_template
   train:
     total_num_envs: 32
     group_size: ${algorithm.group_size}
-    max_episode_steps: 80 # max episode steps for truncation
+    max_episode_steps: 80
     max_steps_per_rollout_epoch: 80
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      video_base_dir: ${runner.logger.log_path}/video/train
+
   eval:
     total_num_envs: 16
     auto_reset: True
@@ -95,6 +107,7 @@ env:
     group_size: 1
     video_cfg:
       save_video: True
+      info_on_video: True
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
@@ -104,7 +117,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "models/Openvla-oft-SFT-libero10-trajall/" # https://huggingface.co/RLinf/Openvla-oft-SFT-libero10-trajall
+    model_path: "models/Openvla-oft-SFT-libero10-trajall/"
     precision: ${actor.model.precision}
 
 actor:
@@ -115,17 +128,12 @@ actor:
   seed: 1234
   enable_offload: True
 
-  # Override the default values in model/openvla_oft
   model:
-    model_path: "models/Openvla-oft-SFT-libero10-trajall/" # https://huggingface.co/RLinf/Openvla-oft-SFT-libero10-trajall
+    model_path: "models/Openvla-oft-SFT-libero10-trajall/"
     model_type: "openvla_oft"
-
     unnorm_key: bridge_orig
     is_lora: True
-    # aka RLinf-OpenVLAOFT-ManiSkill-Base-Lora. It can be downloaded from https://huggingface.co/RLinf/RLinf-OpenVLAOFT-ManiSkill-Base-Lora
-    # lora_path: models/oft-sft/lora_004000
     lora_path: models/OpenVLAOFT-ManiSkill-Base-Lora
-
     max_prompt_length: 30
 
   optim:
@@ -137,7 +145,6 @@ actor:
     weight_decay: 0.01
     clip_grad: 10.0
 
-  # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
     gradient_checkpointing: True
@@ -147,7 +154,27 @@ actor:
       buffer_dtype: ${actor.model.precision}
 
 reward:
-  use_reward_model: False
+  use_reward_model: True
+  group_name: "RewardGroup"
+  enable_offload: True
+
+  reward_mode: "terminal"
+  reward_weight: 1.0
+  env_reward_weight: 0.0
+
+  model:
+    model_type: "roboreward_qwen3vl"
+    model_path: "models/RoboReward-8B"
+    input_type: "video"
+    precision: "bf16"
+    trust_remote_code: True
+    low_cpu_mem_usage: True
+    attn_implementation: "flash_attention_2"
+    max_frames: 8
+    min_frames: 4
+    sample_strategy: "uniform_keep_last"
+    max_new_tokens: 16
+    score_mapping: "normalized"
 
 critic:
   use_critic_model: False
