@@ -28,3 +28,4 @@ PKG-INFO
 prometheus-*/
 data/
 .venv*
+slurm/
