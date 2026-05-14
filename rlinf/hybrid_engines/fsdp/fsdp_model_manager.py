@@ -75,9 +75,7 @@ class FSDPModelManager:
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
-        self._device_mesh = create_device_mesh(
-            world_size, self._cfg.fsdp_config.get("fsdp_size", -1)
-        )
+        self._device_mesh = create_device_mesh(world_size)
         self._dp_group = (
             self._device_mesh["ddp"].get_group()
             if "ddp" in self._device_mesh.mesh_dim_names
@@ -337,6 +335,9 @@ class FSDPModelManager:
             self.optimizer,
             self.lr_scheduler,
             save_path,
+            save_full_model_weights=self._cfg.fsdp_config.get(
+                "save_full_model_weights", True
+            ),
         )
 
         if restore_weight_offload:

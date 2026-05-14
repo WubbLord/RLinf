@@ -28,4 +28,5 @@ PKG-INFO
 prometheus-*/
 data/
 .venv*
-slurm/
+slurm/logs/
+.claude/settings.json
