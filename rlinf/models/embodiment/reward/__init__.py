@@ -18,17 +18,25 @@ from rlinf.models.embodiment.reward.base_image_reward_model import BaseImageRewa
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
 from rlinf.models.embodiment.reward.resnet_reward_model import ResNetRewardModel
 from rlinf.models.embodiment.reward.roboreward_model import RoboRewardModel
+from rlinf.models.embodiment.reward.vlm_reward_model import (
+    HistoryVLMRewardModel,
+    VLMRewardModel,
+)
 
 __all__ = [
     "BaseRewardModel",
     "BaseImageRewardModel",
     "ResNetRewardModel",
     "RoboRewardModel",
+    "VLMRewardModel",
+    "HistoryVLMRewardModel",
 ]
 
 reward_model_registry = {
     "roboreward_qwen3vl": RoboRewardModel,
     "resnet": ResNetRewardModel,
+    "vlm": VLMRewardModel,
+    "history_vlm": HistoryVLMRewardModel,
 }
 
 

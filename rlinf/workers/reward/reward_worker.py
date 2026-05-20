@@ -18,14 +18,14 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader, DistributedSampler
 
-from rlinf.config import torch_dtype_from_precision
 from rlinf.data.datasets.reward_model import RewardBinaryDataset
 from rlinf.data.io_struct import RolloutResult
 from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.models.embodiment.reward import get_reward_model_class
 from rlinf.scheduler import (
     Channel,
     Cluster,
@@ -37,6 +37,7 @@ from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.down_sampling import down_sample_batch
 from rlinf.utils.metric_utils import append_to_dict
+from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
 from rlinf.utils.placement import (
     HybridComponentPlacement,
 )
@@ -49,7 +50,6 @@ class RewardWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         self.cfg = cfg
-
         self.placement = HybridComponentPlacement(cfg, Cluster())
 
     def init_worker(self):
@@ -226,56 +226,54 @@ class EmbodiedRewardWorker(Worker):
         self._use_reward_prob = self.cfg.reward.get("use_reward_prob", False)
 
     def model_provider_func(self):
-        from rlinf.models.embodiment.reward import get_reward_model_class
-
         reward_cls = get_reward_model_class(self.cfg.reward.model.model_type)
 
         model_cfg = self.cfg.reward.model
-        torch_dtype = torch_dtype_from_precision(model_cfg.precision)
-
+        with open_dict(model_cfg):
+            model_cfg.num_envs = self.local_num_train_envs
         model = reward_cls(model_cfg)
-
-        model.to(torch_dtype)
 
         return model
 
     def init_worker(self):
         """Initialize the reward worker for inference."""
-        # build model
+        if self._standalone_realworld:
+            self.local_num_train_envs = self.total_num_train_envs
+            self.dst_ranks = {"train": [(0, self.local_num_train_envs)]}
+            self.src_ranks = {"train": [(0, self.local_num_train_envs)]}
+        else:
+            self.dst_ranks = {
+                "train": self._setup_dst_ranks(
+                    self.total_num_train_envs // self.num_pipeline_stages
+                ),
+            }
+            self.src_ranks = {
+                "train": self._setup_src_ranks(
+                    self.total_num_train_envs // self.num_pipeline_stages
+                ),
+            }
+            self.local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
+
         self.model = self.model_provider_func()
 
         # Move to device and set eval mode
         self.model = self.model.to(self.device)
         self.model.eval()
 
-        if self._standalone_realworld:
-            return
-
-        self.dst_ranks = {
-            "train": self._setup_dst_ranks(
-                self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
-        self.src_ranks = {
-            "train": self._setup_src_ranks(
-                self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
-
+    @Worker.timer("compute_rewards")
     async def compute_rewards(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.model.to(self.device)
 
-        local_num_train_envs = sum(size for _, size in self.src_ranks["train"])
         total_last_run_count = 0
         while True:
-            merged_reward_input, last_run_count = await self.recv_merged_reward_input(
+            reward_input, last_run_count = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_reward_outputs(merged_reward_input)
+            rewards = self._compute_reward_outputs(reward_input)
             self.send_reward_output(output_channel, rewards)
             total_last_run_count += last_run_count
-            if total_last_run_count >= local_num_train_envs:
+            if total_last_run_count >= self.local_num_train_envs:
                 break
 
         if self.enable_offload:
@@ -284,11 +282,17 @@ class EmbodiedRewardWorker(Worker):
     async def recv_merged_reward_input(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
     ) -> tuple[dict[str, Any], int]:
-        """Receive all mapped reward inputs and merge them on the batch dim."""
+        """Receive all mapped reward inputs and merge on batch dimension.
+
+        The env worker sends reward inputs using stable per-rank keys:
+        `CommMapper.build_channel_key(src_rank, reward_rank, extra=f"{mode}_reward_input")`.
+        This function reassembles shards into one batch-aligned dict.
+        """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_ranks[mode]
-        reward_input_batches: list[dict[str, Any]] = []
+        batches: list[dict[str, Any]] = []
         last_run_count = 0
+
         for src_rank, expected_size in src_ranks_and_sizes:
             data = await input_channel.get(
                 key=CommMapper.build_channel_key(
@@ -299,14 +303,13 @@ class EmbodiedRewardWorker(Worker):
             actual_size = self._infer_reward_batch_size(data)
             assert actual_size == expected_size, (
                 f"Expected reward input batch size {expected_size} from env rank {src_rank}, "
-                f"got {actual_size}."
+                f"got batch size {actual_size}."
             )
-            reward_input_batches.append(data)
             last_run = data.get("last_run", None)
             last_run_count += int(last_run.sum().item()) if last_run is not None else 0
+            batches.append(data)
 
-        merged_reward_input = self._merge_reward_input_batches(reward_input_batches)
-        return merged_reward_input, last_run_count
+        return self._merge_reward_input_batches(batches), last_run_count
 
     @staticmethod
     def _merge_reward_field(values: list[Any]) -> Any:
@@ -380,7 +383,7 @@ class EmbodiedRewardWorker(Worker):
     @staticmethod
     def _infer_reward_batch_size(reward_input: Any) -> int:
         if isinstance(reward_input, dict):
-            for key in ("images", "videos", "task_descriptions"):
+            for key in ("main_images", "images", "videos", "task_descriptions"):
                 if key in reward_input and reward_input[key] is not None:
                     return EmbodiedRewardWorker._infer_reward_batch_size(
                         reward_input[key]
@@ -398,13 +401,14 @@ class EmbodiedRewardWorker(Worker):
 
     @Worker.timer("compute_image_rewards")
     def _compute_reward_outputs(self, reward_input: dict[str, Any]) -> torch.Tensor:
-        observations = reward_input
-        task_descriptions = (
-            observations.get("task_descriptions")
-            if isinstance(observations, dict)
-            else None
-        )
-        rewards = self.model.compute_reward(observations, task_descriptions)
+        if self.reward_model_type == "roboreward_qwen3vl":
+            rewards = self.model.compute_reward(
+                reward_input, reward_input.get("task_descriptions")
+            )
+        else:
+            rewards = self.model.compute_reward(reward_input)
+        if rewards is None:
+            return None
         if not isinstance(rewards, torch.Tensor):
             rewards = torch.as_tensor(rewards)
         rewards = rewards.to(device=self.device)
@@ -475,10 +479,13 @@ class EmbodiedRewardWorker(Worker):
             output_channel: Channel carrying rollout->env action chunks.
             reward_tensor: Predicted rewards (tensor or ndarray).
         """
-
         dst_ranks_and_sizes = self.dst_ranks["train"]
         split_sizes = [size for _, size in dst_ranks_and_sizes]
-        reward_tensor_split = list(torch.split(reward_tensor, split_sizes, dim=0))
+        reward_tensor_split = (
+            list(torch.split(reward_tensor, split_sizes, dim=0))
+            if reward_tensor is not None
+            else [None] * len(dst_ranks_and_sizes)
+        )
         for (dst_rank, _), reward_i in zip(dst_ranks_and_sizes, reward_tensor_split):
             if isinstance(reward_i, torch.Tensor):
                 reward_i = reward_i.cpu().contiguous()
@@ -506,10 +513,10 @@ class EmbodiedRewardWorker(Worker):
 
     async def _compute_rewards(self, input_channel: Channel, output_channel: Channel):
         while True:
-            merged_reward_input, _ = await self.recv_merged_reward_input(
+            reward_input, _ = await self.recv_merged_reward_input(
                 input_channel, mode="train"
             )
-            rewards = self._compute_reward_outputs(merged_reward_input)
+            rewards = self._compute_reward_outputs(reward_input)
             self.send_reward_output(output_channel, rewards)
 
     async def stop(self):
@@ -544,16 +551,11 @@ class FSDPRewardWorker(FSDPModelManager, Worker):
         )
 
     def model_provider_func(self):
-        from rlinf.models.embodiment.reward import get_reward_model_class
-
         reward_cls = get_reward_model_class(self.cfg.actor.model.model_type)
 
         model_cfg = self.cfg.actor.model
-        torch_dtype = torch_dtype_from_precision(model_cfg.precision)
 
         model = reward_cls(model_cfg)
-
-        model.to(torch_dtype)
 
         return model
 
