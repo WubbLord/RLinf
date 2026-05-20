@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Optional
 
@@ -25,6 +26,9 @@ from omegaconf import DictConfig
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.models.embodiment.reward.base_reward_model import BaseRewardModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class RoboRewardModel(BaseRewardModel):
@@ -57,6 +61,15 @@ class RoboRewardModel(BaseRewardModel):
         self.max_new_tokens = int(cfg.get("max_new_tokens", 16))
         self.do_sample = bool(cfg.get("do_sample", False))
         self.score_mapping = cfg.get("score_mapping", "normalized")
+        self.invalid_score_policy = cfg.get("invalid_score_policy", "fallback")
+        self.invalid_score = int(cfg.get("invalid_score", 1))
+        self.warn_invalid_scores = bool(cfg.get("warn_invalid_scores", True))
+        if not 1 <= self.invalid_score <= 5:
+            raise ValueError("RoboReward invalid_score must be in [1, 5].")
+        if self.invalid_score_policy not in {"fallback", "error"}:
+            raise ValueError(
+                "RoboReward invalid_score_policy must be 'fallback' or 'error'."
+            )
         self.prompt_template = cfg.get("prompt_template", self.DEFAULT_PROMPT_TEMPLATE)
         self.trust_remote_code = bool(cfg.get("trust_remote_code", True))
         self.low_cpu_mem_usage = bool(cfg.get("low_cpu_mem_usage", True))
@@ -79,6 +92,11 @@ class RoboRewardModel(BaseRewardModel):
             self.model_path,
             trust_remote_code=self.trust_remote_code,
         )
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is not None:
+            tokenizer.padding_side = "left"
+            if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
 
         model_loaders = []
         for loader_name in (
@@ -152,6 +170,22 @@ class RoboRewardModel(BaseRewardModel):
         if fallback_match is not None:
             return int(fallback_match.group(1))
         raise ValueError(f"Could not parse RoboReward score from output: {text!r}")
+
+    def _parse_reward_score_with_fallback(self, text: str) -> int:
+        """Parse model output, optionally falling back for malformed generations."""
+        try:
+            return self.parse_reward_score(text)
+        except ValueError:
+            if self.invalid_score_policy == "error":
+                raise
+            if self.warn_invalid_scores:
+                logger.warning(
+                    "Could not parse RoboReward score; using fallback score %s. "
+                    "Raw output: %r",
+                    self.invalid_score,
+                    text,
+                )
+            return self.invalid_score
 
     @staticmethod
     def map_scores_to_rewards(
@@ -281,7 +315,7 @@ class RoboRewardModel(BaseRewardModel):
         )
 
         scores = torch.tensor(
-            [self.parse_reward_score(text) for text in decoded],
+            [self._parse_reward_score_with_fallback(text) for text in decoded],
             device=device,
             dtype=torch.float32,
         )

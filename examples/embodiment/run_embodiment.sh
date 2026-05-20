@@ -1,4 +1,5 @@
 #! /bin/bash
+set -euo pipefail
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
@@ -7,13 +8,13 @@ export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
 export MUJOCO_GL=${MUJOCO_GL:-"egl"}
 export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-"egl"}
 export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
-export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
+export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH:-}
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
 # Only required when running the behavior experiment.
 export OMNIGIBSON_NO_OMNI_LOGS=${OMNIGIBSON_NO_OMNI_LOGS:-1}
 export OMNIGIBSON_DEBUG=${OMNIGIBSON_DEBUG:-0}
-export OMNIGIBSON_DATA_PATH=$OMNIGIBSON_DATA_PATH
+export OMNIGIBSON_DATA_PATH=${OMNIGIBSON_DATA_PATH:-}
 export OMNIGIBSON_DATASET_PATH=${OMNIGIBSON_DATASET_PATH:-$OMNIGIBSON_DATA_PATH/behavior-1k-assets/}
 export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_KEY_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson.key}
 export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_ASSET_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson-robot-assets/}
@@ -23,14 +24,28 @@ export ISAAC_PATH=${ISAAC_PATH:-/path/to/isaac-sim}
 export EXP_PATH=${EXP_PATH:-$ISAAC_PATH/apps}
 export CARB_APP_PATH=${CARB_APP_PATH:-$ISAAC_PATH/kit}
 
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     CONFIG_NAME=${CONFIG_NAME:-"maniskill_ppo_openvlaoft"}
 else
     CONFIG_NAME=$1
+    shift
 fi
 
 # NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
-ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
+if [ -n "${1:-}" ]; then
+    case "$1" in
+        LIBERO|ALOHA|BRIDGE)
+            ROBOT_PLATFORM=$1
+            shift
+            ;;
+        *)
+            ROBOT_PLATFORM=${ROBOT_PLATFORM:-"LIBERO"}
+            ;;
+    esac
+else
+    ROBOT_PLATFORM=${ROBOT_PLATFORM:-"LIBERO"}
+fi
+EXTRA_ARGS=("$@")
 
 export ROBOT_PLATFORM
 
@@ -52,6 +67,13 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
-echo ${CMD} > ${MEGA_LOG_FILE}
-${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+CMD=(
+    python "${SRC_FILE}"
+    --config-path "${EMBODIED_PATH}/config/"
+    --config-name "${CONFIG_NAME}"
+    "runner.logger.log_path=${LOG_DIR}"
+    "${EXTRA_ARGS[@]}"
+)
+printf "%q " "${CMD[@]}" > "${MEGA_LOG_FILE}"
+printf "\n" >> "${MEGA_LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee -a "${MEGA_LOG_FILE}"

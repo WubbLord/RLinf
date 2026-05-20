@@ -39,6 +39,11 @@ from rlinf.utils.utils import (
 
 
 class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy):
+    # Newer Transformers versions query attention support before Prismatic has
+    # created `language_model`, so use eager attention for this wrapper.
+    _supports_flash_attn_2 = False
+    _supports_sdpa = False
+
     def __init__(
         self,
         config: OpenVLAOFTConfig,

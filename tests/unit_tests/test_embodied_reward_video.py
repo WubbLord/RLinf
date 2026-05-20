@@ -131,3 +131,20 @@ def test_roboreward_parse_and_map_scores():
 
     assert torch.allclose(normalized, torch.tensor([0.0, 0.5, 1.0]))
     assert torch.allclose(centered, torch.tensor([-1.0, 0.0, 1.0]))
+
+
+def test_roboreward_invalid_score_fallback():
+    model = RoboRewardModel.__new__(RoboRewardModel)
+    model.invalid_score_policy = "fallback"
+    model.invalid_score = 1
+    model.warn_invalid_scores = False
+
+    assert model._parse_reward_score_with_fallback("using 3D object tracking") == 1
+
+    model.invalid_score_policy = "error"
+    try:
+        model._parse_reward_score_with_fallback("using 3D object tracking")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected malformed RoboReward output to raise")

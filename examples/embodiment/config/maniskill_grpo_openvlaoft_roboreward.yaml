@@ -11,6 +11,7 @@ defaults:
   - env/maniskill_ood_template@env.eval
   - model/openvla_oft@actor.model
   - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 hydra:
@@ -41,7 +42,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 1
+  save_interval: 3
 
   resume_dir: null
   ckpt_path: null
@@ -148,6 +149,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     gradient_checkpointing: True
+    save_full_model_weights: False
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
@@ -173,8 +175,10 @@ reward:
     max_frames: 8
     min_frames: 4
     sample_strategy: "uniform_keep_last"
-    max_new_tokens: 16
+    max_new_tokens: 32
     score_mapping: "normalized"
+    invalid_score_policy: "fallback"
+    invalid_score: 1
 
 critic:
   use_critic_model: False

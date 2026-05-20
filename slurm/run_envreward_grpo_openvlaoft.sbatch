@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=roboreward-grpo-openvlaoft
+#SBATCH --job-name=envreward-grpo-openvlaoft
 #SBATCH --partition=csail-shared-h200
 #SBATCH --qos=shared-if-available
 #SBATCH --gres=gpu:h200:1
@@ -28,20 +28,13 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export SCRATCH="${SCRATCH:-/data/scratch/zhangbr}"
 export WANDB_DIR="${WANDB_DIR:-${REPO_DIR}/logs/wandb}"
-export RAY_TMPDIR="${RAY_TMPDIR:-${SCRATCH}/ray_tmp/${SLURM_JOB_ID:-roboreward-grpo}}"
+export RAY_TMPDIR="${RAY_TMPDIR:-${SCRATCH}/ray_tmp/${SLURM_JOB_ID:-envreward-grpo}}"
 mkdir -p "${WANDB_DIR}" "${RAY_TMPDIR}"
 
 set -a
 source workspace.env
 set +a
 
-if [[ -f "${REPO_DIR}/.env" ]]; then
-  WANDB_API_KEY_FROM_ENV="$(grep -E '^WANDB_API_KEY=' "${REPO_DIR}/.env" | tail -1 | cut -d'=' -f2- || true)"
-  if [[ -n "${WANDB_API_KEY_FROM_ENV}" ]]; then
-    export WANDB_API_KEY="${WANDB_API_KEY_FROM_ENV}"
-  fi
-  unset WANDB_API_KEY_FROM_ENV
-fi
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
   export WANDB_MODE="${WANDB_MODE:-offline}"
 fi
@@ -108,4 +101,4 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bash examples/embodiment/run_embodiment.sh maniskill_grpo_openvlaoft_roboreward "$@"
+bash examples/embodiment/run_embodiment.sh maniskill_grpo_openvlaoft "$@"
