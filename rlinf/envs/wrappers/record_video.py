@@ -115,11 +115,29 @@ class RecordVideo(gym.Wrapper):
 
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
+        source = self.video_cfg.get("source", "render")
+        if source not in {"render", "obs"}:
+            raise ValueError(
+                f"Unsupported video_cfg.source={source!r}; expected 'render' or 'obs'."
+            )
+
+        obs_image = None
         for key in ("main_images", "images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
-                return obs[key]
+                obs_image = obs[key]
+                break
+
+        if source == "obs":
+            if obs_image is not None:
+                return obs_image
+            if hasattr(self.env, "capture_image"):
+                return self.env.capture_image()
+            return None
+
         if hasattr(self.env, "capture_image"):
             return self.env.capture_image()
+        if obs_image is not None:
+            return obs_image
         return None
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:

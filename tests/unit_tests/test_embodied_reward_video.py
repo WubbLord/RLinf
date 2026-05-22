@@ -2,8 +2,8 @@ import numpy as np
 import torch
 
 from rlinf.models.embodiment.reward.roboreward_model import RoboRewardModel
-from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
+from rlinf.workers.env.reward_video_buffer import RewardVideoBuffer
+from rlinf.workers.reward.reward_worker import RoboRewardEmbodiedRewardWorker
 
 
 def _make_frame(value: int) -> torch.Tensor:
@@ -17,7 +17,7 @@ def test_sample_reward_video_frames_keeps_last_and_pads():
         _make_frame(3).numpy(),
     ]
 
-    sampled = EnvWorker.sample_reward_video_frames(
+    sampled = RewardVideoBuffer.sample_frames(
         frames,
         max_frames=8,
         min_frames=4,
@@ -30,19 +30,17 @@ def test_sample_reward_video_frames_keeps_last_and_pads():
 
 
 def test_env_worker_rollout_video_state_tracks_completed_episode():
-    worker = EnvWorker.__new__(EnvWorker)
-    worker.use_external_reward_model = True
-    worker.reward_input_type = "video"
-    worker.reward_max_frames = 4
-    worker.reward_min_frames = 2
-    worker.reward_sample_strategy = "uniform_keep_last"
-    worker.reward_rollout_buffers = []
+    buffer = RewardVideoBuffer(
+        max_frames=4,
+        min_frames=2,
+        sample_strategy="uniform_keep_last",
+    )
 
     initial_obs = {
         "main_images": torch.stack([_make_frame(10), _make_frame(20)], dim=0),
         "task_descriptions": ["task a", "task b"],
     }
-    worker._reset_reward_rollout_state(0, initial_obs)
+    buffer.reset(0, initial_obs)
 
     obs_list = [
         {
@@ -72,7 +70,7 @@ def test_env_worker_rollout_video_state_tracks_completed_episode():
         dtype=torch.bool,
     )
 
-    worker._update_reward_rollout_state(
+    buffer.update(
         0,
         obs_list,
         infos_list,
@@ -84,7 +82,7 @@ def test_env_worker_rollout_video_state_tracks_completed_episode():
         "main_images": torch.stack([_make_frame(12), _make_frame(22)], dim=0),
         "task_descriptions": ["task a next", "task b"],
     }
-    reward_input = worker._build_video_reward_input(
+    reward_input = buffer.build_input(
         stage_id=0,
         reward_input_obs=reward_input_obs,
         done_envs=torch.tensor([True, False], dtype=torch.bool),
@@ -94,7 +92,7 @@ def test_env_worker_rollout_video_state_tracks_completed_episode():
     assert reward_input["task_descriptions"][0] == "task a done"
     assert reward_input["task_descriptions"][1] == "task b"
 
-    state = worker.reward_rollout_buffers[0]
+    state = buffer.state(0)
     assert state["pending_videos"][0] is None
     assert state["pending_task_descriptions"][0] is None
     assert np.all(state["current_videos"][0][0] == 12)
@@ -114,11 +112,11 @@ def test_reward_input_merge_and_batch_size():
         },
     ]
 
-    merged = EmbodiedRewardWorker._merge_reward_input_batches(payloads)
+    merged = RoboRewardEmbodiedRewardWorker._merge_reward_input_batches(payloads)
 
     assert merged["videos"].shape == (3, 2, 2, 2, 3)
     assert merged["task_descriptions"] == ["task a", "task b", "task c"]
-    assert EmbodiedRewardWorker._infer_reward_batch_size(merged) == 3
+    assert RoboRewardEmbodiedRewardWorker._infer_reward_batch_size(merged) == 3
 
 
 def test_roboreward_parse_and_map_scores():

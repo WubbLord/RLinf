@@ -50,26 +50,7 @@ STANDARD_EVAL_LOG_DIR="${STANDARD_EVAL_LOG_DIR:-${REPO_DIR}/logs/eval/${RUN_TAG}
 REWARD_ROLLOUT_LOG_DIR="${REWARD_ROLLOUT_LOG_DIR:-${REPO_DIR}/logs/eval/${RUN_TAG}-roboreward_rollout}"
 
 STANDARD_EVAL_EXTRA_OVERRIDES=("$@")
-REWARD_ROLLOUT_EXTRA_OVERRIDES=()
-for override in "$@"; do
-  case "${override}" in
-    env.eval.total_num_envs=*)
-      REWARD_ROLLOUT_EXTRA_OVERRIDES+=("env.train.total_num_envs=${override#*=}")
-      ;;
-    algorithm.eval_rollout_epoch=*)
-      REWARD_ROLLOUT_EXTRA_OVERRIDES+=("algorithm.rollout_epoch=${override#*=}")
-      ;;
-    env.eval.video_cfg.save_video=*)
-      REWARD_ROLLOUT_EXTRA_OVERRIDES+=("env.train.video_cfg.save_video=${override#*=}")
-      ;;
-    env.eval.video_cfg.info_on_video=*)
-      REWARD_ROLLOUT_EXTRA_OVERRIDES+=("env.train.video_cfg.info_on_video=${override#*=}")
-      ;;
-    *)
-      REWARD_ROLLOUT_EXTRA_OVERRIDES+=("${override}")
-      ;;
-  esac
-done
+REWARD_ROLLOUT_EXTRA_OVERRIDES=("$@")
 
 NUM_GPUS="${SLURM_GPUS_ON_NODE:-1}"
 if [[ ! "${NUM_GPUS}" =~ ^[0-9]+$ ]]; then
@@ -156,8 +137,8 @@ python examples/embodiment/eval_roboreward_rollout.py \
   "runner.ckpt_path=${FULL_WEIGHTS}" \
   "runner.logger.log_path=${REWARD_ROLLOUT_LOG_DIR}" \
   "runner.logger.experiment_name=roboreward_gs500_reward_outputs" \
-  "env.train.video_cfg.save_video=True" \
-  "env.train.video_cfg.info_on_video=True" \
+  "env.eval.video_cfg.save_video=True" \
+  "env.eval.video_cfg.info_on_video=True" \
   "${REWARD_ROLLOUT_EXTRA_OVERRIDES[@]}"
 
 echo "Full weights: ${FULL_WEIGHTS}"

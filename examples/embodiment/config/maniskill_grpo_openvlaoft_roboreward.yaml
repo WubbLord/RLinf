@@ -97,6 +97,7 @@ env:
     video_cfg:
       save_video: True
       info_on_video: True
+      source: render
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
@@ -109,6 +110,7 @@ env:
     video_cfg:
       save_video: True
       info_on_video: True
+      source: render
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:

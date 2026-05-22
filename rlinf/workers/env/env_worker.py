@@ -42,6 +42,7 @@ from rlinf.utils.nested_dict_process import (
 )
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.history_manager import HistoryManager
+from rlinf.workers.env.reward_video_buffer import RewardVideoBuffer
 
 
 class EnvWorker(Worker):
@@ -83,33 +84,6 @@ class EnvWorker(Worker):
         if self.use_external_reward_model:
             self.reward_weight = self.cfg.reward.get("reward_weight", 1.0)
             self.env_reward_weight = self.cfg.reward.get("env_reward_weight", 0.0)
-            self.reward_input_type = self.cfg.reward.model.get("input_type", "image")
-            self.reward_sample_strategy = self.cfg.reward.model.get(
-                "sample_strategy", "uniform_keep_last"
-            )
-            self.reward_max_frames = int(self.cfg.reward.model.get("max_frames", 8))
-            self.reward_min_frames = int(self.cfg.reward.model.get("min_frames", 4))
-            if self.reward_max_frames < self.reward_min_frames:
-                raise ValueError(
-                    "reward.model.max_frames must be greater than or equal to "
-                    "reward.model.min_frames."
-                )
-            if self.reward_input_type not in {"image", "video"}:
-                raise ValueError(
-                    f"Unsupported reward input_type: {self.reward_input_type}. "
-                    "Expected `image` or `video`."
-                )
-            if self.reward_input_type == "video" and self.reward_mode != "terminal":
-                raise ValueError(
-                    "Video-based reward models currently support terminal reward mode only."
-                )
-        else:
-            self.reward_input_type = "image"
-            self.reward_sample_strategy = "uniform_keep_last"
-            self.reward_max_frames = 8
-            self.reward_min_frames = 4
-
-        self.reward_rollout_buffers: list[dict[str, Any]] = []
 
         # Env configurations
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
@@ -355,6 +329,22 @@ class EnvWorker(Worker):
                     ),
                 }
             )
+            if self.cfg.get("reward", {}).get("use_reward_model", False):
+                dst_rank_map.update(
+                    {
+                        "reward_eval": CommMapper.get_dst_ranks(
+                            batch_size=self.cfg.env.eval.total_num_envs
+                            // self.stage_num,
+                            src_world_size=self._component_placement.get_world_size(
+                                "env"
+                            ),
+                            dst_world_size=self._component_placement.get_world_size(
+                                "reward"
+                            ),
+                            src_rank=self._rank,
+                        ),
+                    }
+                )
         return dst_rank_map
 
     def _setup_src_rank_map(self) -> dict[str, list[tuple[int, int]]]:
@@ -406,6 +396,22 @@ class EnvWorker(Worker):
                     ),
                 }
             )
+            if self.cfg.get("reward", {}).get("use_reward_model", False):
+                src_rank_map.update(
+                    {
+                        "reward_eval": CommMapper.get_src_ranks(
+                            batch_size=self.cfg.env.eval.total_num_envs
+                            // self.stage_num,
+                            src_world_size=self._component_placement.get_world_size(
+                                "reward"
+                            ),
+                            dst_world_size=self._component_placement.get_world_size(
+                                "env"
+                            ),
+                            dst_rank=self._rank,
+                        ),
+                    }
+                )
         return src_rank_map
 
     def _init_env(self):
@@ -414,111 +420,14 @@ class EnvWorker(Worker):
                 extracted_obs, _ = self.env_list[i].reset()
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
-                self._reset_reward_rollout_state(i, extracted_obs)
+                self._after_train_reset(i, extracted_obs)
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
 
-    @staticmethod
-    def _to_numpy_frame(frame: Any) -> np.ndarray | None:
-        if frame is None:
-            return None
-        if isinstance(frame, torch.Tensor):
-            frame = frame.detach().cpu().numpy()
-        else:
-            frame = np.asarray(frame)
-        if frame.dtype != np.uint8:
-            frame = np.clip(frame, 0, 255).astype(np.uint8)
-        return frame
+    def _after_train_reset(self, stage_id: int, obs: Any):
+        pass
 
-    @staticmethod
-    def _extract_main_images(obs: Any) -> list[np.ndarray | None]:
-        if not isinstance(obs, dict):
-            return []
-        images = obs.get("main_images")
-        if images is None:
-            return []
-        if isinstance(images, torch.Tensor):
-            images = images.detach().cpu().numpy()
-        else:
-            images = np.asarray(images)
-        return [EnvWorker._to_numpy_frame(image) for image in images]
-
-    @staticmethod
-    def _extract_task_descriptions(obs: Any) -> list[str | None]:
-        if not isinstance(obs, dict):
-            return []
-        task_descriptions = obs.get("task_descriptions")
-        if task_descriptions is None:
-            return []
-        if isinstance(task_descriptions, (list, tuple)):
-            return [
-                None if task_description is None else str(task_description)
-                for task_description in task_descriptions
-            ]
-        return [str(task_descriptions)]
-
-    @staticmethod
-    def sample_reward_video_frames(
-        frames: list[np.ndarray],
-        *,
-        max_frames: int,
-        min_frames: int,
-        sample_strategy: str = "uniform_keep_last",
-    ) -> np.ndarray:
-        """Convert one rollout's raw frame list to a fixed-size video tensor."""
-        if len(frames) == 0:
-            raise ValueError("Cannot sample a reward video from an empty frame list.")
-        if sample_strategy != "uniform_keep_last":
-            raise ValueError(
-                f"Unsupported reward video sample strategy: {sample_strategy!r}."
-            )
-
-        if len(frames) == 1:
-            sampled_frames = [frames[0]]
-        else:
-            sample_count = min(len(frames), max_frames)
-            indices = np.linspace(0, len(frames) - 1, sample_count, dtype=int)
-            indices[-1] = len(frames) - 1
-            sampled_frames = [frames[idx] for idx in indices]
-
-        target_num_frames = max(max_frames, min_frames)
-        while len(sampled_frames) < target_num_frames:
-            sampled_frames.append(sampled_frames[-1].copy())
-        return np.stack(sampled_frames, axis=0)
-
-    def _ensure_reward_rollout_state(self, stage_id: int, batch_size: int):
-        while len(self.reward_rollout_buffers) <= stage_id:
-            self.reward_rollout_buffers.append({})
-        state = self.reward_rollout_buffers[stage_id]
-        if state.get("num_envs") == batch_size:
-            return
-        self.reward_rollout_buffers[stage_id] = {
-            "num_envs": batch_size,
-            "current_videos": [[] for _ in range(batch_size)],
-            "current_task_descriptions": [None for _ in range(batch_size)],
-            "pending_videos": [None for _ in range(batch_size)],
-            "pending_task_descriptions": [None for _ in range(batch_size)],
-        }
-
-    def _reset_reward_rollout_state(self, stage_id: int, obs: Any):
-        if not (self.use_external_reward_model and self.reward_input_type == "video"):
-            return
-        frames = self._extract_main_images(obs)
-        task_descriptions = self._extract_task_descriptions(obs)
-        batch_size = len(frames)
-        self._ensure_reward_rollout_state(stage_id, batch_size)
-        state = self.reward_rollout_buffers[stage_id]
-        state["current_videos"] = [
-            [frame] if frame is not None else [] for frame in frames
-        ]
-        state["current_task_descriptions"] = [
-            task_descriptions[idx] if idx < len(task_descriptions) else None
-            for idx in range(batch_size)
-        ]
-        state["pending_videos"] = [None for _ in range(batch_size)]
-        state["pending_task_descriptions"] = [None for _ in range(batch_size)]
-
-    def _update_reward_rollout_state(
+    def _after_train_chunk_step(
         self,
         stage_id: int,
         obs_list: list[Any] | tuple[Any, ...],
@@ -527,158 +436,21 @@ class EnvWorker(Worker):
         *,
         auto_reset: bool,
     ):
-        if not (self.use_external_reward_model and self.reward_input_type == "video"):
-            return
-        if not isinstance(obs_list, (list, tuple)) or len(obs_list) == 0:
-            return
+        pass
 
-        initial_frames = self._extract_main_images(obs_list[0])
-        if len(initial_frames) == 0:
-            return
-        self._ensure_reward_rollout_state(stage_id, len(initial_frames))
-        state = self.reward_rollout_buffers[stage_id]
-        done_so_far = np.zeros(state["num_envs"], dtype=bool)
+    def _after_eval_reset(self, stage_id: int, obs: Any):
+        pass
 
-        for time_idx, step_obs in enumerate(obs_list):
-            step_frames = self._extract_main_images(step_obs)
-            step_task_descriptions = self._extract_task_descriptions(step_obs)
-            step_infos = infos_list[time_idx] if len(infos_list) > time_idx else None
-            terminal_obs = (
-                step_infos.get("final_observation")
-                if isinstance(step_infos, dict)
-                else None
-            )
-            reset_mask = (
-                step_infos.get("_final_observation")
-                if isinstance(step_infos, dict)
-                else None
-            )
-            terminal_frames = self._extract_main_images(terminal_obs)
-            terminal_task_descriptions = self._extract_task_descriptions(terminal_obs)
-            if reset_mask is not None:
-                if isinstance(reset_mask, torch.Tensor):
-                    reset_mask = reset_mask.detach().cpu().numpy().astype(bool)
-                else:
-                    reset_mask = np.asarray(reset_mask, dtype=bool)
-            else:
-                reset_mask = np.zeros(state["num_envs"], dtype=bool)
-
-            for env_idx in range(state["num_envs"]):
-                step_done = bool(chunk_dones[env_idx, time_idx].item())
-                current_frame = (
-                    step_frames[env_idx] if env_idx < len(step_frames) else None
-                )
-                current_task_description = (
-                    step_task_descriptions[env_idx]
-                    if env_idx < len(step_task_descriptions)
-                    else None
-                )
-                terminal_frame = (
-                    terminal_frames[env_idx] if env_idx < len(terminal_frames) else None
-                )
-                terminal_task_description = (
-                    terminal_task_descriptions[env_idx]
-                    if env_idx < len(terminal_task_descriptions)
-                    else None
-                )
-
-                if step_done and not done_so_far[env_idx]:
-                    final_frame = terminal_frame
-                    if final_frame is None:
-                        final_frame = current_frame
-                    if final_frame is not None:
-                        state["current_videos"][env_idx].append(final_frame)
-                    final_task_description = (
-                        terminal_task_description
-                        or state["current_task_descriptions"][env_idx]
-                        or current_task_description
-                    )
-                    state["current_task_descriptions"][env_idx] = final_task_description
-                    state["pending_videos"][env_idx] = type(
-                        self
-                    ).sample_reward_video_frames(
-                        state["current_videos"][env_idx],
-                        max_frames=self.reward_max_frames,
-                        min_frames=self.reward_min_frames,
-                        sample_strategy=self.reward_sample_strategy,
-                    )
-                    state["pending_task_descriptions"][env_idx] = final_task_description
-                    done_so_far[env_idx] = True
-
-                    if auto_reset and reset_mask[env_idx]:
-                        state["current_videos"][env_idx] = (
-                            [current_frame] if current_frame is not None else []
-                        )
-                        state["current_task_descriptions"][env_idx] = (
-                            current_task_description or final_task_description
-                        )
-                    else:
-                        state["current_videos"][env_idx] = []
-                    continue
-
-                if done_so_far[env_idx] and not auto_reset:
-                    continue
-                if current_frame is not None:
-                    state["current_videos"][env_idx].append(current_frame)
-                if current_task_description is not None:
-                    state["current_task_descriptions"][env_idx] = (
-                        current_task_description
-                    )
-
-    def _build_video_reward_input(
+    def _after_eval_chunk_step(
         self,
         stage_id: int,
-        reward_input_obs: dict[str, Any],
-        done_envs: torch.Tensor,
-    ) -> dict[str, Any]:
-        state = self.reward_rollout_buffers[stage_id]
-        fallback_frames = self._extract_main_images(reward_input_obs)
-        fallback_task_descriptions = self._extract_task_descriptions(reward_input_obs)
-
-        videos: list[torch.Tensor] = []
-        task_descriptions: list[str] = []
-        num_envs = state["num_envs"]
-        for env_idx in range(num_envs):
-            pending_video = state["pending_videos"][env_idx]
-            if pending_video is None:
-                current_frames = state["current_videos"][env_idx]
-                if len(current_frames) == 0 and env_idx < len(fallback_frames):
-                    fallback_frame = fallback_frames[env_idx]
-                    current_frames = (
-                        [fallback_frame] if fallback_frame is not None else []
-                    )
-                if len(current_frames) == 0:
-                    raise ValueError(
-                        "Failed to build reward video input because no frames were buffered."
-                    )
-                pending_video = type(self).sample_reward_video_frames(
-                    current_frames,
-                    max_frames=self.reward_max_frames,
-                    min_frames=self.reward_min_frames,
-                    sample_strategy=self.reward_sample_strategy,
-                )
-
-            task_description = (
-                state["pending_task_descriptions"][env_idx]
-                or state["current_task_descriptions"][env_idx]
-                or (
-                    fallback_task_descriptions[env_idx]
-                    if env_idx < len(fallback_task_descriptions)
-                    else None
-                )
-                or ""
-            )
-            videos.append(torch.from_numpy(pending_video).to(torch.uint8))
-            task_descriptions.append(str(task_description))
-
-            if done_envs[env_idx].item():
-                state["pending_videos"][env_idx] = None
-                state["pending_task_descriptions"][env_idx] = None
-
-        return {
-            "videos": torch.stack(videos, dim=0),
-            "task_descriptions": task_descriptions,
-        }
+        obs_list: list[Any] | tuple[Any, ...],
+        infos_list: list[Any] | tuple[Any, ...],
+        chunk_dones: torch.Tensor,
+        *,
+        auto_reset: bool,
+    ):
+        pass
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
@@ -706,7 +478,7 @@ class EnvWorker(Worker):
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
-        self._update_reward_rollout_state(
+        self._after_train_chunk_step(
             stage_id,
             obs_list,
             infos_list,
@@ -786,6 +558,13 @@ class EnvWorker(Worker):
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
+        self._after_eval_chunk_step(
+            stage_id,
+            obs_list,
+            infos_list,
+            chunk_dones,
+            auto_reset=self.cfg.env.eval.auto_reset,
+        )
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)
             if self.use_external_reward_model
@@ -816,6 +595,10 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            env_infos=infos if isinstance(infos, dict) else None,
+            dones=chunk_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
         )
         return env_output, env_info
 
@@ -1069,9 +852,13 @@ class EnvWorker(Worker):
             )
 
     @Worker.timer("recv_reward_results")
-    def recv_reward_results(self, recv_channel: Channel) -> torch.Tensor:
+    def recv_reward_results(
+        self,
+        recv_channel: Channel,
+        mode: Literal["train", "eval"] = "train",
+    ) -> torch.Tensor:
         reward_results: list[torch.Tensor] = []
-        src_ranks_and_sizes = self.src_rank_map["reward_train"]
+        src_ranks_and_sizes = self.src_rank_map[f"reward_{mode}"]
         for src_rank, expected_size in src_ranks_and_sizes:
             rewards = recv_channel.get(
                 key=CommMapper.build_channel_key(
@@ -1096,6 +883,8 @@ class EnvWorker(Worker):
         recv_channel: Channel,
         stage_id: int | None = None,
         last_run: bool = False,
+        mode: Literal["train", "eval"] = "train",
+        scatter_terminal: bool = True,
     ):
         if self.reward_mode in {"per_step", "history_buffer"}:
             observations = (
@@ -1121,6 +910,8 @@ class EnvWorker(Worker):
         if self.reward_mode == "history_buffer":
             if stage_id is None:
                 raise ValueError("stage_id is required for history-buffer reward.")
+            if mode != "train":
+                raise ValueError("history-buffer reward is only supported in train mode.")
             history_manager = self.train_history_managers[stage_id]
             history_manager.append_to_history_entries(observations)
             history_input, history_lengths = history_manager.build_history_input(
@@ -1136,32 +927,58 @@ class EnvWorker(Worker):
             self.reward_mode == "terminal"
             and done_envs is not None
             and not bool(done_envs.any().item())
+            and not last_run
         ):
             if env_output.rewards is None:
                 return None
             return torch.zeros_like(env_output.rewards, dtype=torch.float32)
 
-        if self.reward_input_type == "video":
-            reward_input = self._build_video_reward_input(
-                stage_id=stage_id,
-                reward_input_obs=observations,
-                done_envs=done_envs,
-            )
+        reward_input = self._prepare_reward_model_input(
+            reward_input=reward_input,
+            env_output=env_output,
+            observations=observations,
+            done_envs=done_envs,
+            stage_id=stage_id,
+            mode=mode,
+        )
         if last_run:
+            num_envs_per_stage = (
+                self.train_num_envs_per_stage
+                if mode == "train"
+                else self.eval_num_envs_per_stage
+            )
             reward_input.update(
                 {
                     "last_run": torch.ones(
-                        (self.train_num_envs_per_stage, 1), dtype=torch.bool
+                        (num_envs_per_stage, 1), dtype=torch.bool
                     )
                 }
             )
-        self.send_reward_input(send_channel=send_channel, reward_input=reward_input)
-        reward_output = self.recv_reward_results(recv_channel=recv_channel)
-        if self.reward_mode != "terminal" or reward_output is None:
+        self.send_reward_input(
+            send_channel=send_channel, reward_input=reward_input, mode=mode
+        )
+        reward_output = self.recv_reward_results(recv_channel=recv_channel, mode=mode)
+        if (
+            not scatter_terminal
+            or self.reward_mode != "terminal"
+            or reward_output is None
+        ):
             return reward_output
         return self._scatter_terminal_reward_output(
             env_output=env_output, reward_output=reward_output
         )
+
+    def _prepare_reward_model_input(
+        self,
+        *,
+        reward_input: dict[str, Any],
+        env_output: EnvOutput,
+        observations: dict[str, Any],
+        done_envs: torch.Tensor | None,
+        stage_id: int | None,
+        mode: Literal["train", "eval"],
+    ) -> dict[str, Any]:
+        return reward_input
 
     def _select_reward_env_infos(self, env_infos: dict[str, Any]) -> dict[str, Any]:
         reward_env_infos = {}
@@ -1226,7 +1043,7 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 self.env_list[stage_id].is_start = True
                 extracted_obs, infos = self.env_list[stage_id].reset()
-                self._reset_reward_rollout_state(stage_id, extracted_obs)
+                self._after_train_reset(stage_id, extracted_obs)
                 dones = get_zero_dones()
                 terminations = dones.clone()
                 truncations = dones.clone()
@@ -1533,6 +1350,7 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    self._after_eval_reset(stage_id, extracted_obs)
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1600,3 +1418,212 @@ class EnvWorker(Worker):
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(recv_num, send_num)
         return split_num
+
+
+class VideoRewardEnvWorker(EnvWorker):
+    """Env worker extension for terminal video reward models."""
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+
+        if not self.use_external_reward_model:
+            raise ValueError(
+                "VideoRewardEnvWorker requires reward.use_reward_model=True and "
+                "reward.standalone_realworld=False."
+            )
+        self.reward_input_type = self.cfg.reward.model.get("input_type", "image")
+        if self.reward_input_type != "video":
+            raise ValueError(
+                "VideoRewardEnvWorker requires reward.model.input_type=video."
+            )
+        if self.reward_mode != "terminal":
+            raise ValueError(
+                "VideoRewardEnvWorker currently supports terminal reward mode only."
+            )
+
+        self.reward_video_buffer = RewardVideoBuffer(
+            max_frames=int(self.cfg.reward.model.get("max_frames", 8)),
+            min_frames=int(self.cfg.reward.model.get("min_frames", 4)),
+            sample_strategy=self.cfg.reward.model.get(
+                "sample_strategy", "uniform_keep_last"
+            ),
+        )
+
+    @staticmethod
+    def sample_reward_video_frames(
+        frames: list[np.ndarray],
+        *,
+        max_frames: int,
+        min_frames: int,
+        sample_strategy: str = "uniform_keep_last",
+    ) -> np.ndarray:
+        return RewardVideoBuffer.sample_frames(
+            frames,
+            max_frames=max_frames,
+            min_frames=min_frames,
+            sample_strategy=sample_strategy,
+        )
+
+    def _after_train_reset(self, stage_id: int, obs: Any):
+        self.reward_video_buffer.reset(stage_id, obs)
+
+    def _after_train_chunk_step(
+        self,
+        stage_id: int,
+        obs_list: list[Any] | tuple[Any, ...],
+        infos_list: list[Any] | tuple[Any, ...],
+        chunk_dones: torch.Tensor,
+        *,
+        auto_reset: bool,
+    ):
+        self.reward_video_buffer.update(
+            stage_id,
+            obs_list,
+            infos_list,
+            chunk_dones,
+            auto_reset=auto_reset,
+        )
+
+    def _after_eval_reset(self, stage_id: int, obs: Any):
+        self.reward_video_buffer.reset(stage_id, obs)
+
+    def _after_eval_chunk_step(
+        self,
+        stage_id: int,
+        obs_list: list[Any] | tuple[Any, ...],
+        infos_list: list[Any] | tuple[Any, ...],
+        chunk_dones: torch.Tensor,
+        *,
+        auto_reset: bool,
+    ):
+        self.reward_video_buffer.update(
+            stage_id,
+            obs_list,
+            infos_list,
+            chunk_dones,
+            auto_reset=auto_reset,
+        )
+
+    def _prepare_reward_model_input(
+        self,
+        *,
+        reward_input: dict[str, Any],
+        env_output: EnvOutput,
+        observations: dict[str, Any],
+        done_envs: torch.Tensor | None,
+        stage_id: int | None,
+        mode: Literal["train", "eval"],
+    ) -> dict[str, Any]:
+        if stage_id is None:
+            raise ValueError("stage_id is required for video reward input.")
+        if done_envs is None:
+            raise ValueError("EnvOutput.dones is required for video reward input.")
+        return self.reward_video_buffer.build_input(
+            stage_id=stage_id,
+            reward_input_obs=observations,
+            done_envs=done_envs,
+        )
+
+    def evaluate_with_reward_model(
+        self,
+        input_channel: Channel,
+        rollout_channel: Channel,
+        reward_channel: Channel,
+    ):
+        """Run one eval rollout per env slot and score each rollout with RoboReward."""
+        eval_metrics = defaultdict(list)
+
+        for _ in range(self.cfg.algorithm.eval_rollout_epoch):
+            env_outputs: list[EnvOutput | None] = [None for _ in range(self.stage_num)]
+
+            for stage_id in range(self.stage_num):
+                self.eval_env_list[stage_id].is_start = True
+                self.eval_prev_done[stage_id] = torch.zeros(
+                    self.eval_num_envs_per_stage, dtype=torch.bool
+                )
+                extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                self._after_eval_reset(stage_id, extracted_obs)
+                env_output = EnvOutput(
+                    obs=extracted_obs,
+                    final_obs=(
+                        infos["final_observation"]
+                        if "final_observation" in infos
+                        else None
+                    ),
+                )
+                env_batch = env_output.to_dict()
+                self.send_env_batch(
+                    rollout_channel,
+                    {
+                        "obs": env_batch["obs"],
+                        "final_obs": env_batch["final_obs"],
+                    },
+                    mode="eval",
+                )
+
+            for eval_step in range(self.n_eval_chunk_steps):
+                for stage_id in range(self.stage_num):
+                    raw_chunk_actions = self.recv_chunk_actions(
+                        input_channel, mode="eval"
+                    )
+                    env_output, env_info = self.env_evaluate_step(
+                        raw_chunk_actions, stage_id
+                    )
+                    env_outputs[stage_id] = env_output
+
+                    for key, value in env_info.items():
+                        eval_metrics[key].append(value)
+
+                    if eval_step == self.n_eval_chunk_steps - 1:
+                        continue
+                    env_batch = env_output.to_dict()
+                    self.send_env_batch(
+                        rollout_channel,
+                        {
+                            "obs": env_batch["obs"],
+                            "final_obs": env_batch["final_obs"],
+                        },
+                        mode="eval",
+                    )
+
+            for stage_id, env_output in enumerate(env_outputs):
+                if env_output is None:
+                    continue
+                reward_model_output = self.get_reward_model_output(
+                    env_output,
+                    send_channel=reward_channel,
+                    recv_channel=input_channel,
+                    stage_id=stage_id,
+                    last_run=True,
+                    mode="eval",
+                    scatter_terminal=False,
+                )
+                if reward_model_output is not None:
+                    eval_metrics["roboreward_terminal"].append(
+                        reward_model_output.detach().float().reshape(-1).cpu()
+                    )
+
+            self.finish_rollout(mode="eval")
+
+        for stage_id in range(self.stage_num):
+            if self.cfg.env.eval.get("enable_offload", False) and hasattr(
+                self.eval_env_list[stage_id], "offload"
+            ):
+                self.eval_env_list[stage_id].offload()
+
+        for key, value in eval_metrics.items():
+            eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        return eval_metrics
+
+
+def get_env_worker_class(cfg: DictConfig):
+    reward_cfg = cfg.get("reward", {})
+    reward_model_cfg = reward_cfg.get("model", {})
+    if (
+        reward_cfg.get("use_reward_model", False)
+        and not reward_cfg.get("standalone_realworld", False)
+        and reward_model_cfg.get("input_type", "image") == "video"
+    ):
+        return VideoRewardEnvWorker
+    return EnvWorker

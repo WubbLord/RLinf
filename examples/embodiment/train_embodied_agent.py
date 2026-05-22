@@ -22,8 +22,8 @@ from rlinf.config import validate_cfg
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
+from rlinf.workers.env.env_worker import get_env_worker_class
+from rlinf.workers.reward.reward_worker import get_embodied_reward_worker_class
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
@@ -74,7 +74,8 @@ def main(cfg) -> None:
 
     # Create env worker group
     env_placement = component_placement.get_strategy("env")
-    env_group = EnvWorker.create_group(cfg).launch(
+    env_worker_cls = get_env_worker_class(cfg)
+    env_group = env_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
 
@@ -84,7 +85,8 @@ def main(cfg) -> None:
     ).get("standalone_realworld", False):
         # Create reward worker group
         reward_placement = component_placement.get_strategy("reward")
-        reward_group = EmbodiedRewardWorker.create_group(cfg).launch(
+        reward_worker_cls = get_embodied_reward_worker_class(cfg)
+        reward_group = reward_worker_cls.create_group(cfg).launch(
             cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
         )
 
