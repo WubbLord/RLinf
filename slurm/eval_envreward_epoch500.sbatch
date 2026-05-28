@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=roboreward-eval-gs500
+#SBATCH --job-name=envreward-eval-gs500
 #SBATCH --partition=csail-shared-h200
 #SBATCH --qos=shared-if-available
 #SBATCH --gres=gpu:h200:1
@@ -31,7 +31,7 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
 export SCRATCH="${SCRATCH:-/data/scratch/zhangbr}"
 export WANDB_DIR="${WANDB_DIR:-${REPO_DIR}/logs/wandb}"
-export RAY_TMPDIR="${RAY_TMPDIR:-${SCRATCH}/ray_tmp/${SLURM_JOB_ID:-roboreward-eval}}"
+export RAY_TMPDIR="${RAY_TMPDIR:-${SCRATCH}/ray_tmp/${SLURM_JOB_ID:-envreward-eval}}"
 export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-180}"
 mkdir -p "${WANDB_DIR}" "${RAY_TMPDIR}"
 
@@ -43,10 +43,10 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
   export WANDB_MODE="${WANDB_MODE:-offline}"
 fi
 
-CKPT_DIR="${CKPT_DIR:-${REPO_DIR}/logs/20260519-10:14:00-maniskill_grpo_openvlaoft_roboreward/maniskill_grpo_openvlaoft_roboreward/checkpoints/global_step_500}"
-EXPORT_DIR="${EXPORT_DIR:-${REPO_DIR}/logs/exported_full_weights/roboreward_global_step_500}"
-FULL_WEIGHTS="${FULL_WEIGHTS:-${EXPORT_DIR}/actor/model_state_dict/full_weights.pt}"
-RUN_TAG="${RUN_TAG:-$(date +'%Y%m%d-%H%M%S')-roboreward-gs500}"
+CKPT_DIR="${CKPT_DIR:-${REPO_DIR}/logs/20260522-20:51:10-maniskill_grpo_openvlaoft/maniskill_grpo_openvlaoft/checkpoints/global_step_500}"
+EXPORT_DIR="${EXPORT_DIR:-${REPO_DIR}/logs/exported_full_weights/envreward_global_step_500}"
+FULL_WEIGHTS="${FULL_WEIGHTS:-${CKPT_DIR}/actor/model_state_dict/full_weights.pt}"
+RUN_TAG="${RUN_TAG:-$(date +'%Y%m%d-%H%M%S')-envreward-gs500}"
 EVAL_LOG_DIR="${EVAL_LOG_DIR:-${REPO_DIR}/logs/eval/${RUN_TAG}}"
 
 EVAL_EXTRA_OVERRIDES=()
@@ -120,15 +120,16 @@ PY
 export RAY_ADDRESS
 echo "Using RAY_ADDRESS=${RAY_ADDRESS}"
 
-export EXPORT_RESUME_DIR="${CKPT_DIR}"
-export EXPORT_OUTPUT_DIR="${EXPORT_DIR}"
 if [[ ! -f "${FULL_WEIGHTS}" ]]; then
+  export EXPORT_RESUME_DIR="${CKPT_DIR}"
+  export EXPORT_OUTPUT_DIR="${EXPORT_DIR}"
+  FULL_WEIGHTS="${EXPORT_DIR}/actor/model_state_dict/full_weights.pt"
   python examples/embodiment/export_fsdp_full_weights.py \
     --config-path "${EMBODIED_PATH}/config" \
-    --config-name maniskill_grpo_openvlaoft_roboreward
+    --config-name maniskill_grpo_openvlaoft
   rm -rf "${EXPORT_DIR}/actor/dcp_checkpoint"
 else
-  echo "Using existing exported weights at ${FULL_WEIGHTS}"
+  echo "Using existing full weights at ${FULL_WEIGHTS}"
 fi
 test -f "${FULL_WEIGHTS}"
 
@@ -137,7 +138,7 @@ python examples/embodiment/eval_roboreward_rollout.py \
   --config-name maniskill_grpo_openvlaoft_roboreward \
   "runner.ckpt_path=${FULL_WEIGHTS}" \
   "runner.logger.log_path=${EVAL_LOG_DIR}" \
-  "runner.logger.experiment_name=roboreward_gs500_eval" \
+  "runner.logger.experiment_name=envreward_gs500_eval" \
   "env.eval.video_cfg.save_video=True" \
   "env.eval.video_cfg.info_on_video=True" \
   "env.eval.video_cfg.video_base_dir=${EVAL_LOG_DIR}/video" \

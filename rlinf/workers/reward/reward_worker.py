@@ -280,9 +280,7 @@ class EmbodiedRewardWorker(Worker):
         if self.enable_offload:
             self.model.to(self.device)
 
-        expected_last_run_count = (
-            self.local_num_train_envs if mode == "train" else self.local_num_eval_envs
-        )
+        expected_last_run_count = self._expected_last_run_count(mode)
         total_last_run_count = 0
         while True:
             reward_input, last_run_count = await self.recv_merged_reward_input(
@@ -296,6 +294,9 @@ class EmbodiedRewardWorker(Worker):
 
         if self.enable_offload:
             self.model.to("cpu")
+
+    def _expected_last_run_count(self, mode: Literal["train", "eval"]) -> int:
+        return self.local_num_train_envs if mode == "train" else self.local_num_eval_envs
 
     async def recv_merged_reward_input(
         self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
@@ -476,6 +477,11 @@ class EmbodiedRewardWorker(Worker):
 
 class RoboRewardEmbodiedRewardWorker(EmbodiedRewardWorker):
     """Reward worker extension for RoboReward video inputs."""
+
+    def _expected_last_run_count(self, mode: Literal["train", "eval"]) -> int:
+        if mode == "eval":
+            return self.local_num_eval_envs * self.cfg.algorithm.eval_rollout_epoch
+        return super()._expected_last_run_count(mode)
 
     @staticmethod
     def _merge_reward_field(values: list[Any]) -> Any:

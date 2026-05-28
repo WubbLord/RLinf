@@ -1,0 +1,11 @@
+model,epoch,success_once,roboreward_avg,rollouts,log_dir
+Env-reward GRPO,100,0.27734375,0.0537109375,512,logs/eval/envreward-gs100-eval-20260524-202400
+Env-reward GRPO,200,0.330078125,0.0703125,512,logs/eval/envreward-gs200-eval-20260524-201707
+Env-reward GRPO,300,0.544921875,0.0595703125,512,logs/eval/envreward-gs300-eval-20260525-114430
+Env-reward GRPO,400,0.642578125,0.0400390625,512,logs/eval/envreward-gs400-eval-20260525-114430
+Env-reward GRPO,500,0.689453125,0.0263671875,512,logs/eval/20260524-160354-envreward-gs500-roboreward_rollout
+RoboReward GRPO,100,0.365234375,0.0703125,512,logs/eval/roboreward-gs100-eval-20260524-201707
+RoboReward GRPO,200,0.556640625,0.0498046875,512,logs/eval/roboreward-gs200-eval-20260524-201707
+RoboReward GRPO,300,0.56640625,0.0419921875,512,logs/eval/roboreward-gs300-eval-20260525-114430
+RoboReward GRPO,400,0.638671875,0.04345703125,512,logs/eval/roboreward-gs400-eval-20260524-201707
+RoboReward GRPO,500,0.6796875,0.3056640625,512,logs/eval/20260521-085043-roboreward-gs500-roboreward_rollout

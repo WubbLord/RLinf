@@ -36,7 +36,10 @@ source workspace.env
 set +a
 
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  export WANDB_MODE="${WANDB_MODE:-offline}"
+  if [[ "${WANDB_MODE:-}" == "online" ]]; then
+    echo "WANDB_MODE=online requested but WANDB_API_KEY is not set; using offline mode."
+  fi
+  export WANDB_MODE="offline"
 fi
 
 NUM_GPUS="${SLURM_GPUS_ON_NODE:-1}"
@@ -101,4 +104,60 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bash examples/embodiment/run_embodiment.sh maniskill_grpo_openvlaoft "$@"
+CONFIG_NAME="maniskill_grpo_openvlaoft"
+EXTRA_OVERRIDES=()
+for override in "$@"; do
+  case "${override}" in
+    runner.resume_dir=*)
+      resume_dir="${override#*=}"
+      if [[ "${resume_dir}" != "null" && "${resume_dir}" != "None" && -n "${resume_dir}" ]]; then
+        resume_dir="$(
+          python - "${resume_dir}" "${CONFIG_NAME}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+resume_dir = Path(sys.argv[1]).expanduser()
+config_name = sys.argv[2]
+if not resume_dir.is_absolute():
+    resume_dir = Path.cwd() / resume_dir
+resume_dir = resume_dir.resolve()
+
+if (resume_dir / "actor").is_dir():
+    print(resume_dir)
+    raise SystemExit(0)
+
+candidate_roots = [
+    resume_dir / config_name / "checkpoints",
+    resume_dir / "checkpoints",
+    resume_dir,
+]
+candidates = []
+for root in candidate_roots:
+    if not root.is_dir():
+        continue
+    for path in root.glob("global_step_*"):
+        match = re.fullmatch(r"global_step_(\d+)", path.name)
+        if match and (path / "actor").is_dir():
+            candidates.append((int(match.group(1)), path))
+
+if not candidates:
+    raise SystemExit(
+        f"Could not resolve runner.resume_dir={resume_dir} to a checkpoint "
+        "directory containing actor/. Pass .../checkpoints/global_step_N."
+    )
+
+print(max(candidates, key=lambda item: item[0])[1])
+PY
+        )"
+        echo "Resolved runner.resume_dir=${resume_dir}"
+      fi
+      EXTRA_OVERRIDES+=("runner.resume_dir=${resume_dir}")
+      ;;
+    *)
+      EXTRA_OVERRIDES+=("${override}")
+      ;;
+  esac
+done
+
+bash examples/embodiment/run_embodiment.sh "${CONFIG_NAME}" "${EXTRA_OVERRIDES[@]}"
